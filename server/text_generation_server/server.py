@@ -18,8 +18,110 @@ from text_generation_server.tracing import UDSOpenTelemetryAioServerInterceptor
 
 from .profiler import Profiler
 
-class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
+import time
+import shelve
+import signal
+import concurrent.futures
+import threading
+import torch.profiler
+
+class EagerService(object):
+    def __init__(self, enabled, eager_requests : list):
+        #logger.info(f"eager service init {eager_requests}")
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='EagerServiceThread')
+        # self._loop = asyncio.new_event_loop()
+        # self._executor.submit(lambda : asyncio.set_event_loop(self._loop)).result()
+        self._eager_requests = eager_requests
+        self._predicted_request = None
+        self._predicted_response = self._executor.submit(lambda : None)
+        self._enabled = enabled
+
+    @staticmethod
+    def _thread_function(request_handler, self, request, context):
+        #logger.info(f"_thread_function {asyncio.get_event_loop()} {threading.current_thread().ident} {type(request)}")
+        # loop = asyncio.get_event_loop()
+        try:
+            # response = loop.run_until_complete(request_handler(self, request, context))
+            response = request_handler(self, request, context)
+            #logger.info(f"_thread_function finished {type(response)}")
+        except ValueError as e:
+            #logger.info(f"{e}")
+            #logger.info(f"_thread_function something went wrong")
+            response = None
+
+        return response
+
+    @staticmethod
+    def enable(request_handler):
+        def wrapping_handler(self, request, context):
+            if not self._enabled:
+                return request_handler(self, request, context)
+
+            (predicted_req, predicted_res) = (self._predicted_request, self._predicted_response)
+
+            ###################################################################
+            # Handle request:
+            # 1. If the prediction was right wait and use the result
+            # 2. Otherwise try to cancel and handle the right request
+            ###################################################################
+            if request == predicted_req:
+                response = predicted_res.result()
+                if response is None:
+                    response = request_handler(self, request, context)
+            else:
+                if not predicted_res.cancel():
+                    predicted_res.result()
+                assert predicted_res.done()
+                response = request_handler(self, request, context)
+
+            ###################################################################
+            # Submit new request eagerly (does not wait for the router)
+            # Predict the same request
+            ###################################################################
+            if type(request) in self._eager_requests:
+                self._predicted_request = request
+                self._predicted_response = self._executor.submit(EagerService._thread_function, request_handler, self, request, context)
+            else:
+                self._predicted_request = None
+                self._predicted_response = self._executor.submit(lambda : None)
+            ###################################################################
+
+
+
+            return response
+        return wrapping_handler
+
+
+def tracing(request_handler):
+    def wrapper(self, request, context):
+        res = request_handler(self, request, context)
+        #self.mydb[time.time_ns()] = (type(request).__name__, request.SerializeToString(), type(res).__name__,  res.SerializeToString())
+        #self.mydb[time.time_ns()] = (type(request).__name__, type(res).__name__)
+
+        self.trace_db[str(time.time_ns())] = (type(request).__name__ , request.SerializeToString(), type(res).__name__ , res.SerializeToString())
+
+        logger.info(f"GMORYS len db {len(self.trace_db)}")
+        # logger.info(f"{(type(request_handler), type(self), request.SerializeToString(), res.SerializeToString())}")
+        return res
+    return wrapper
+
+class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer, EagerService):
     def __init__(self, model: Model, cache: Cache, server_urls: List[str]):
+        super(TextGenerationService, self).__init__(enabled=True, eager_requests=[generate_pb2.DecodeRequest])
+        wait_steps = 5
+        warmup_steps = 5
+        active_steps = 3
+        repeat = 1
+        trace_dir = "torch_profile_trace"
+        worker_name = "TextGenerationService"
+        self.torch_profiler = torch.profiler.profile(
+                    activities=(torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU),
+                    schedule=torch.profiler.schedule(wait=wait_steps, warmup=warmup_steps, active=active_steps, repeat=repeat),
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir, worker_name=worker_name, use_gzip=True),
+                    record_shapes=False,
+                    with_stack=True)
+        self.torch_profiler.start()
+
         self.profiler = Profiler()
         with self.profiler.record_event("external", "init"):
             self.cache = cache
@@ -32,18 +134,58 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             # Force inference mode for the lifetime of TextGenerationService
             # self._inference_mode_raii_guard = torch._C._InferenceMode(True)
 
+    @property
+    def trace_db(self):
+        return self._trace_db
+
+    @trace_db.setter
+    def trace_db(self, value):
+        self._trace_db = value
+
     async def Info(self, request, context):
-        return self.model.info
+        return TextGenerationService._Info(self, request, context)
 
     async def Health(self, request, context):
+        return TextGenerationService._Health(self, request, context)
+
+    async def ServiceDiscovery(self, request, context):
+        return TextGenerationService._ServiceDiscovery(self, request, context)
+
+    async def ClearCache(self, request, context):
+        return TextGenerationService._ClearCache(self, request, context)
+
+    async def FilterBatch(self, request, context):
+        return TextGenerationService._FilterBatch(self, request, context)
+
+    async def Warmup(self, request, context):
+        return TextGenerationService._Warmup(self, request, context)
+
+    async def Prefill(self, request, context):
+        return TextGenerationService._Prefill(self, request, context)
+
+    async def Decode(self, request, context):
+        return TextGenerationService._Decode(self, request, context)
+
+    @tracing
+    @EagerService.enable
+    def _Info(self, request, context):
+        return self.model.info
+
+    @tracing
+    @EagerService.enable
+    def _Health(self, request, context):
         if self.model.device.type == "hpu":
             torch.zeros((2, 2)).to("hpu")
         return generate_pb2.HealthResponse()
 
-    async def ServiceDiscovery(self, request, context):
+    @tracing
+    @EagerService.enable
+    def _ServiceDiscovery(self, request, context):
         return generate_pb2.ServiceDiscoveryResponse(urls=self.server_urls)
 
-    async def ClearCache(self, request, context):
+    @tracing
+    @EagerService.enable
+    def _ClearCache(self, request, context):
         with self.profiler.record_event("external", "clear_cache"):
             if request.HasField("id"):
                 self.cache.delete(request.id)
@@ -51,7 +193,9 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
                 self.cache.clear()
             return generate_pb2.ClearCacheResponse()
 
-    async def FilterBatch(self, request, context):
+    @tracing
+    @EagerService.enable
+    def _FilterBatch(self, request, context):
         batch = self.cache.pop(request.batch_id)
         with self.profiler.record_event("external",
                                         "filter_batch",
@@ -64,7 +208,9 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
 
             return generate_pb2.FilterBatchResponse(batch=filtered_batch.to_pb())
 
-    async def Warmup(self, request, context):
+    @tracing
+    @EagerService.enable
+    def _Warmup(self, request, context):
         with self.profiler.record_event("external", "warmup"):
             # batch = self.model.batch_type.from_pb(
             #     request.batch, self.model.tokenizer, self.model.dtype, self.model.device
@@ -77,7 +223,9 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             logger.warning("Warmup is not enabled on HPU.")
             return generate_pb2.WarmupResponse()
 
-    async def Prefill(self, request, context):
+    @tracing
+    @EagerService.enable
+    def _Prefill(self, request, context):
         batch = self.model.batch_type.from_pb(
             request.batch, self.model.tokenizer, self.model.dtype, self.model.device, self.model.is_optimized_for_gaudi
         )
@@ -92,7 +240,11 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
                 batch=next_batch.to_pb() if next_batch else None,
             )
 
-    async def Decode(self, request, context):
+    @tracing
+    @EagerService.enable
+    def _Decode(self, request, context):
+        #logger.info("Decode {}".format([(b.id, b.request_ids) for b in request.batches]))
+        self.torch_profiler.step()
         batch0 = self.cache.cache[request.batches[0].id]
         with self.profiler.record_event("external",
                                         "decode",
@@ -101,12 +253,15 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             if len(request.batches) == 0:
                 raise ValueError("Must provide at least one batch")
 
-            batches = []
-            for batch_pb in request.batches:
-                batch = self.cache.pop(batch_pb.id)
-                if batch is None:
-                    raise ValueError(f"Batch ID {batch_pb.id} not found in cache.")
-                batches.append(batch)
+            request_batches = set([batch_pb.id for batch_pb in request.batches])
+            cache_batches = set(self.cache.keys())
+            #logger.info(f"Decode2 {request_batches} {cache_batches}")
+            if len(missing := request_batches.difference(cache_batches)) != 0:
+                #logger.info(f"Decode3 throw exception {missing}")
+                raise ValueError(f"Batches {missing} not found in cache.")
+            else:
+                #logger.info(f"Decode3 no exception {missing}")
+                batches = [self.cache.pop(batch_pb.id) for batch_pb in request.batches]
 
             if len(batches) == 0:
                 raise ValueError("All batches are empty")
@@ -185,8 +340,25 @@ def serve(
                 UDSOpenTelemetryAioServerInterceptor(),
             ]
         )
+        current_handler = signal.getsignal(signal.SIGTERM)
+
+        tgi_service = TextGenerationService(model, Cache(), server_urls)
+        tgi_service.trace_db = shelve.open('tgi_trace')
+
+        def handler(sig, frame):
+            tgi_service.torch_profiler.stop()
+            logger.info(f"STOPPED PROFILER")
+            tgi_service.trace_db.close()
+            logger.info(f"Closed trace - len db {len(tgi_service.trace_db)}")
+            tgi_service._executor.shutdown(cancel_futures=True)
+            logger.info(f"Executor stopped")
+            if callable(current_handler):
+                current_handler(sig, frame)
+            logger.info(f"Old handler executed")
+
+        signal.signal(signal.SIGTERM, handler)
         generate_pb2_grpc.add_TextGenerationServiceServicer_to_server(
-            TextGenerationService(model, Cache(), server_urls), server
+            tgi_service, server
         )
         SERVICE_NAMES = (
             generate_pb2.DESCRIPTOR.services_by_name["TextGenerationService"].full_name,

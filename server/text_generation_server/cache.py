@@ -30,5 +30,8 @@ class Cache:
         for k in keys:
             self.delete(k)
 
+    def keys(self):
+        return self.cache.keys()
+
     def __len__(self):
         return len(self.cache.keys())
