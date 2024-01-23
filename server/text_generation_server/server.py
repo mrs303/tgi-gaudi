@@ -18,8 +18,53 @@ from text_generation_server.tracing import UDSOpenTelemetryAioServerInterceptor
 
 from .profiler import Profiler
 
+import time
+import shelve
+import signal
+import concurrent.futures
+import threading
+import torch.profiler
+
 class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
     def __init__(self, model: Model, cache: Cache, server_urls: List[str]):
+        wait_steps = 390
+        warmup_steps = 3
+        active_steps = 3
+        repeat = 1
+        trace_dir = "."
+        worker_name = "TextGenerationService"
+
+        dummy = lambda : 0
+
+        if int(os.getenv("RANK", "0")) == 0:
+            self.torch_profiler = torch.profiler.profile(
+                        activities=(torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU),
+                        schedule=torch.profiler.schedule(wait=wait_steps, warmup=warmup_steps, active=active_steps, repeat=repeat),
+                        on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir, worker_name=worker_name, use_gzip=True),
+                        record_shapes=False,
+                        with_stack=True)
+            self.torch_profiler.start()
+
+            self.step_no = 1
+            def _step():
+                self.torch_profiler.step()
+                out = self.step_no
+                self.step_no += 1
+                return out
+            self._step = _step
+
+            def _profiler_stop():
+                logger.info("Stopping profiler...")
+                self.torch_profiler.stop()
+                logger.info("Profiler stopped")
+                self._step = dummy
+                self.profiler_stop = dummy
+
+            self.profiler_stop = _profiler_stop
+        else:
+            self._step = dummy
+            self.profiler_stop = dummy
+
         self.profiler = Profiler()
         with self.profiler.record_event("external", "init"):
             self.cache = cache
@@ -78,10 +123,11 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             return generate_pb2.WarmupResponse()
 
     async def Prefill(self, request, context):
+        step_no = self._step()
         batch = self.model.batch_type.from_pb(
             request.batch, self.model.tokenizer, self.model.dtype, self.model.device, self.model.is_optimized_for_gaudi
         )
-        with self.profiler.record_event("external", "prefill", {"batch_size": batch.input_ids.size(0)}):
+        with self.profiler.record_event("external", "prefill#{}".format(step_no), {"batch_size": batch.input_ids.size(0)}):
 
             with self.profiler.record_event("internal", "generate_token"):
                 generations, next_batch = self.model.generate_token(batch)
@@ -93,9 +139,10 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             )
 
     async def Decode(self, request, context):
+        step_no = self._step()
         batch0 = self.cache.cache[request.batches[0].id]
         with self.profiler.record_event("external",
-                                        "decode",
+                                        "decode#{}".format(step_no),
                                         {"request_batches": [batch.id for batch in request.batches], "batch_size": batch0.input_ids.size(0)},
                                         {"util": len(batch0.requests)}):
             if len(request.batches) == 0:
@@ -185,8 +232,18 @@ def serve(
                 UDSOpenTelemetryAioServerInterceptor(),
             ]
         )
+        current_handler = signal.getsignal(signal.SIGTERM)
+
+        tgi_service = TextGenerationService(model, Cache(), server_urls)
+
+        def handler(sig, frame):
+            tgi_service.profiler_stop()
+            if callable(current_handler):
+                current_handler(sig, frame)
+
+        signal.signal(signal.SIGTERM, handler)
         generate_pb2_grpc.add_TextGenerationServiceServicer_to_server(
-            TextGenerationService(model, Cache(), server_urls), server
+            tgi_service, server
         )
         SERVICE_NAMES = (
             generate_pb2.DESCRIPTOR.services_by_name["TextGenerationService"].full_name,
