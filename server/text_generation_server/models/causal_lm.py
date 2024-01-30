@@ -97,24 +97,14 @@ def move_data(dst_tensor, chunk_size, indices, src_tensors):
     return result
 
 
-def shift(tensor, dim, offset):
-    shape = tensor.shape
-    elements = shape[dim]
-    if offset == 0 or abs(offset) > elements:
-        return tensor
-    import habana_frameworks.torch as htorch
-    htorch.core.mark_step()
-    # We generate indices from (0 - offset + elements) to (elements - offset + elements)
-    # so that next modulo operation operates on positive values
-    indices = torch.arange(0, elements, dtype=torch.int32, device=tensor.device)
-    offset = torch.tensor(-offset + elements, dtype=torch.int32, device=tensor.device)
-    indices.add_(offset)
-    indices.remainder_(elements)
-    target_shape = [1,] * len(tensor.shape)
-    target_shape[dim] = elements
-    indices = indices.view(target_shape).expand(shape)
-    result = torch.gather(tensor, dim, indices)
-    htorch.core.mark_step()
+def generate_shift_chunks(offset):
+    chunk_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    result = []
+    while offset != 0:
+        sign = 1 if offset > 0 else -1
+        best_chunk = min((abs(offset - sign * c), sign * c) for c in chunk_sizes)[1]
+        result.append(best_chunk)
+        offset = offset - best_chunk
     return result
 
 
@@ -122,6 +112,7 @@ def roll(tensor, dim, chunks):
     dbg_trace('ROLL', f'shape:{list(tensor.shape)} dim:{dim} chunks:{chunks}')
     for c in chunks:
         tensor = torch.roll(tensor, c, dim)
+        import habana_frameworks.torch as htorch
         htorch.core.mark_step()
     return tensor
 
@@ -323,6 +314,7 @@ class CausalLMBatch(Batch):
             del b.past_key_values
 
         src_keys = [torch.stack(src) for src in src_keys]
+        import habana_frameworks.torch as htorch
         htorch.core.mark_step()
         src_keys = pad_tensors(src_keys, extra_padding, key_dim, 0)
         src_keys = shift_all(src_keys, key_dim, offsets)

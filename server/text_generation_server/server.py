@@ -146,7 +146,6 @@ def serve(
         diagnose=False,
     )
 
-
     async def serve_inner(
         model_id: str,
         revision: Optional[str],
