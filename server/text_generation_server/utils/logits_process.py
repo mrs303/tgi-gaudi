@@ -1,5 +1,6 @@
 import math
 import torch
+import habana_frameworks.torch.core as htcore
 
 from functools import lru_cache
 from typing import Optional, List, Dict, Union
@@ -46,7 +47,6 @@ class StaticWarper:
             self.static_scores = scores.clone().contiguous()
             self.static_warped_scores = scores.clone().contiguous()
             self.static_next_logprob = scores.clone().contiguous()
-            import habana_frameworks.torch.core as htcore
             self.hpu_graph = htcore.hpu.HPUGraph()
 
             with htcore.hpu.graph(self.hpu_graph):
