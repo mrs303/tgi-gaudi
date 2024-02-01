@@ -16,11 +16,14 @@ export LOG_LEVEL=debug
 
 export QUANT_CONFIG=/software/users/gmorys/mlperf_inference/code/llama/hqt/llama2-70b-8x/config_meas_maxabs_quant_MAXABS_HW.json
 #export LOG_LEVEL_PT_SYNHELPER=0
-export GRAPH_VISUALIZATION=1
+#export GRAPH_VISUALIZATION=1
 #export ENABLE_GVD=1
+#export ENABLE_EXPERIMENTAL_FLAGS=true
+#export ENABLE_PARTIAL_GVD=true
 
-
+rm -rf * .graph_dumps; ll
+rm -r /var/log/habana_logs/*
 text-generation-launcher --port 8080 \
     --model-id /mnt/weka/data/pytorch/llama2/Llama-2-$model-chat-hf \
     --sharded true --num-shard 8 --max-batch-prefill-tokens $MAX_INPUT_SEQ_LEN --max-batch-total-tokens $max_batch_total_tokens \
-    --max-concurrent-requests 1024 --max-waiting-tokens 1
+    --max-concurrent-requests 1024 --max-waiting-tokens 1 --dtype bfloat16

@@ -16,8 +16,10 @@ export LOG_LEVEL=debug
 
 export QUANT_CONFIG=/software/users/gmorys/mlperf_inference/code/llama/hqt/llama2-70b-8x/config_meas_maxabs_quant_MAXABS_HW.json
 #export LOG_LEVEL_PT_SYNHELPER=0
-export GRAPH_VISUALIZATION=1
+#export GRAPH_VISUALIZATION=1
 #export ENABLE_GVD=1
+#export ENABLE_EXPERIMENTAL_FLAGS=true
+#export ENABLE_PARTIAL_GVD=true
 
 python /software/users/gmorys/mlperf_inference/code/llama/main.py --scenario Offline --total-sample-count 140 --model-type llama-v2-70b --accuracy --max-num-threads 256 && echo "}" >> server_events.json && sed -i 's/]\[/,/g' server_events.json
 #python /nfs/trees/npu-stack/mlperf_inference/code/llama/main.py --scenario Offline --total-sample-count 128 --model-type llama-v2-70b --accuracy --max-num-threads 256
