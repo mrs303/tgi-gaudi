@@ -14,6 +14,7 @@ from typing import Optional, Tuple, List, Type, Dict
 import text_generation_server.habana_quantization_env as hq_env
 import habana_frameworks.torch as htorch
 from habana_frameworks.torch.hpu import wrap_in_hpu_graph
+from habana_frameworks.torch.hpex.kernels.Fp8Ops import cast_to_fp8_v2
 from contextlib import nullcontext
 from optimum.habana.utils import HabanaProfile, to_gb_rounded
 
@@ -147,6 +148,30 @@ def remove_kv_cache_from_output(module):
         else:
             kwargs["return_dict"] = True
             return orig_fwd(*args, **kwargs)
+
+    module.forward = forward
+    return module
+
+def cast_kv_cache_to_fp8(module):
+    orig_fwd = module.forward
+
+    def cast_helper(obj):
+        if isinstance(obj, tuple):
+            return tuple(map(lambda x: cast_helper(x), obj))
+        else:
+            assert isinstance(obj, torch.Tensor)
+            if obj.dtype != torch.float8_e4m3fn:
+                return cast_to_fp8_v2(obj, None, False, False, torch.float8_e4m3fn)[0]
+            else:
+                return obj
+
+    @wraps(orig_fwd)
+    def forward(*args, **kwargs):
+        outputs = orig_fwd(*args, **kwargs)
+        # cast to fp8 past values returned by prefill
+        if kwargs["past_key_values"] is None:
+            outputs.past_key_values = cast_helper(outputs.past_key_values)
+        return outputs
 
     module.forward = forward
     return module
@@ -570,6 +595,10 @@ class CausalLM(Model):
             model = model.module
             model = self.prepare_model_for_quantization(model)
             model = remove_kv_cache_from_output(model)
+
+            if hq_env.is_quantization_enabled:
+                model = cast_kv_cache_to_fp8(model)
+
             if self.enable_hpu_graph:
                 model = wrap_in_hpu_graph(model, disable_tensor_cache=True)
 
@@ -584,6 +613,10 @@ class CausalLM(Model):
             model = model.eval().to(device)
             # wrap in hpu_graph only if self.enable_hpu_graph is set
             model = remove_kv_cache_from_output(model)
+
+            if hq_env.is_quantization_enabled:
+                model = cast_kv_cache_to_fp8(model)
+
             if self.enable_hpu_graph:
                 model = wrap_in_hpu_graph(model, disable_tensor_cache=True)
         model = self.setup_quantization(model)
