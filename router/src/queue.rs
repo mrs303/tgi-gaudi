@@ -173,38 +173,88 @@ impl PartialOrd for IdentifiableEntry {
 struct QueueImpl {
     regular_entries: BinaryHeap<IdentifiableEntry>,
     overdue_entries: BinaryHeap<IdentifiableEntry>,
+    deprioritized_entries: BinaryHeap<IdentifiableEntry>,
     overdue_threshold: Duration,
+    deprioritize_threshold: Duration,
 }
 
 impl QueueImpl {
-    fn new(capacity: usize, overdue_threshold: Duration) -> Self {
+    fn new(capacity: usize) -> Self {
+        let overdue_threshold = {
+            let default: u64 = 120;
+            match env::var("REQUEST_PRIORITIZE_THRESHOLD_MS") {
+                Ok(val) => val.parse().unwrap_or(default),
+                Err(_) => default,
+            }
+        };
+
+        let deprioritize_threshold = {
+            let default: u64 = 1900;
+            let threshold = match env::var("REQUEST_DEPRIORITIZE_THRESHOLD_MS") {
+                Ok(val) => val.parse().unwrap_or(default),
+                Err(_) => default,
+            };
+
+            if threshold < overdue_threshold {
+                tracing::warn!("REQUEST_DEPRIORITIZE_THRESHOLD_MS cannot be set to value smaller than REQUEST_PRIORITIZE_THRESHOLD_MS, overriding to {}", overdue_threshold);
+                overdue_threshold
+            } else {
+                threshold
+            }
+        };
+
         Self {
             regular_entries: BinaryHeap::with_capacity(capacity),
             overdue_entries: BinaryHeap::with_capacity(capacity),
-            overdue_threshold,
+            deprioritized_entries: BinaryHeap::with_capacity(capacity),
+            overdue_threshold: Duration::from_millis(overdue_threshold),
+            deprioritize_threshold: Duration::from_millis(deprioritize_threshold),
         }
     }
 
-    fn update(&mut self) {
-        if self.regular_entries.is_empty() {
+    fn move_entries(
+        src: &mut BinaryHeap<IdentifiableEntry>,
+        dst: &mut BinaryHeap<IdentifiableEntry>,
+        threshold: Duration,
+    ) {
+        if src.is_empty() {
             return;
         }
 
-        let mut left = BinaryHeap::with_capacity(self.regular_entries.capacity());
+        let mut left = BinaryHeap::with_capacity(src.capacity());
 
-        for entry in self.regular_entries.drain() {
-            if entry.1.queue_time.elapsed() > self.overdue_threshold {
-                self.overdue_entries.push(entry);
+        for entry in src.drain() {
+            if entry.1.queue_time.elapsed() > threshold {
+                dst.push(entry);
             } else {
                 left.push(entry);
             }
         }
 
-        self.regular_entries = left;
+        *src = left;
+    }
+
+    fn update(&mut self) {
+        assert!(self.deprioritize_threshold >= self.overdue_threshold);
+
+        Self::move_entries(
+            &mut self.regular_entries,
+            &mut self.overdue_entries,
+            self.overdue_threshold,
+        );
+        Self::move_entries(
+            &mut self.overdue_entries,
+            &mut self.deprioritized_entries,
+            self.deprioritize_threshold,
+        );
     }
 
     fn push(&mut self, entry: IdentifiableEntry) {
-        if entry.1.queue_time.elapsed() > self.overdue_threshold {
+        assert!(self.deprioritize_threshold >= self.overdue_threshold);
+
+        if entry.1.queue_time.elapsed() > self.deprioritize_threshold {
+            self.deprioritized_entries.push(entry);
+        } else if entry.1.queue_time.elapsed() > self.overdue_threshold {
             self.overdue_entries.push(entry);
         } else {
             self.regular_entries.push(entry);
@@ -212,19 +262,34 @@ impl QueueImpl {
     }
 
     fn pop(&mut self) -> Option<IdentifiableEntry> {
-        if !self.overdue_entries.is_empty() {
-            self.overdue_entries.pop()
-        } else {
-            self.regular_entries.pop()
+        let mut queues = vec![
+            &mut self.overdue_entries,
+            &mut self.regular_entries,
+            &mut self.deprioritized_entries,
+        ];
+
+        match queues.iter_mut().find(|q| !q.is_empty()) {
+            Some(q) => (*q).pop(),
+            None => None,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.regular_entries.is_empty() && self.overdue_entries.is_empty()
+        self.inner_queues()
+            .iter()
+            .fold(false, |acc, &q| acc && q.is_empty())
     }
 
     fn len(&self) -> usize {
-        self.regular_entries.len() + self.overdue_entries.len()
+        self.inner_queues().iter().fold(0, |acc, &q| acc + q.len())
+    }
+
+    fn inner_queues(&self) -> Vec<&BinaryHeap<IdentifiableEntry>> {
+        vec![
+            &self.overdue_entries,
+            &self.regular_entries,
+            &self.deprioritized_entries,
+        ]
     }
 }
 
@@ -264,14 +329,8 @@ impl State {
         block_size: u32,
         window_size: Option<u32>,
     ) -> Self {
-        let default_threshold: u64 = 120;
-        let threshold: u64 = match env::var("QUEUE_THRESHOLD_MS") {
-            Ok(val) => val.parse().unwrap_or(default_threshold),
-            Err(_) => default_threshold,
-        };
-
         Self {
-            entries: QueueImpl::new(128, Duration::from_millis(threshold)),
+            entries: QueueImpl::new(128),
             next_id: 0,
             next_batch_id: 0,
             requires_padding,

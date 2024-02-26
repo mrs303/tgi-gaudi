@@ -87,7 +87,8 @@ Environment Variables Added:
 | SKIP_TOKENIZER_IN_TGI       | True/False | False            | Skip tokenizer for input/output processing                                                                                       | add -e in docker run command |
 | TGI_PROFILER_ENABLED        | True/False | False            | Collect high-level server tracing events                                                                                         | add -e in docker run command |
 | WARMUP_ENABLED              | True/False | True             | Enable warmup during server initialization to recompile all graphs. This can increase TGI setup time.                            | add -e in docker run command |
-| QUEUE_THRESHOLD_MS          | integer    | 120              | Controls the threshold beyond which the request are considered overdue and handled with priority. Shorter requests are prioritized otherwise.                            | add -e in docker run command |
+| REQUEST_PRIORITIZE_THRESHOLD_MS | integer   | 120           | Controls the threshold beyond which the request are considered overdue and handled with priority. Shorter requests are prioritized otherwise. | add -e in docker run command |
+| REQUEST_DEPRIORITIZE_THRESHOLD_MS | integer | 1900          | Controls the threshold beyond which the request are deprioritized                                                                | add -e in docker run command |
 </div>
 
 
